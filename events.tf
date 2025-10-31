@@ -8,12 +8,6 @@ resource "aws_cloudwatch_event_rule" "containment_request" {
   tags = local.tags
 }
 
-resource "aws_cloudwatch_event_target" "containment_to_sfn" {
-  rule      = aws_cloudwatch_event_rule.containment_request.name
-  target_id = "sfn"
-  arn       = aws_sfn_state_machine.containment.arn
-}
-
 resource "aws_iam_role" "events_invoke_sfn" {
   name               = "${local.name}-events-sfn-role"
   assume_role_policy = jsonencode({
