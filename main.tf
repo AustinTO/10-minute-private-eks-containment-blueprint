@@ -11,8 +11,9 @@ data "aws_availability_zones" "available" {
 }
 
 locals {
-  name   = basename(path.cwd)
-  region = "us-west-2"
+  base_name = replace(basename(path.cwd), "_", "-")
+  name      = substr(local.base_name, 0, 25)
+  region    = "us-west-2"
 
   vpc_cidr = "10.0.0.0/16"
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
@@ -46,11 +47,13 @@ module "eks" {
 
   eks_managed_node_groups = {
     initial = {
-      instance_types = ["m5.large"]
+      instance_types = ["t4g.small"]
+      ami_type       = "AL2_ARM_64"
+      capacity_type  = "SPOT"
 
-      min_size     = 1
-      max_size     = 5
-      desired_size = 3
+      min_size     = 0
+      max_size     = 1
+      desired_size = 0
     }
   }
 

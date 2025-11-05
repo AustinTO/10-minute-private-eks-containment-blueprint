@@ -2,7 +2,10 @@
 data "aws_iam_policy_document" "lambda_assume" {
   statement {
     actions = ["sts:AssumeRole"]
-    principals { type = "Service", identifiers = ["lambda.amazonaws.com"] }
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
   }
 }
 
@@ -15,22 +18,28 @@ resource "aws_iam_role" "lambda_exec" {
 # Basic permissions: CW Logs + write evidence to S3
 data "aws_iam_policy_document" "lambda_policy" {
   statement {
-    sid     = "Logs"
-    effect  = "Allow"
-    actions = ["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"]
+    sid       = "Logs"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["*"]
   }
   statement {
-    sid     = "EvidenceWrite"
-    effect  = "Allow"
-    actions = ["s3:PutObject","s3:AbortMultipartUpload","s3:CreateMultipartUpload","s3:UploadPart","s3:CompleteMultipartUpload"]
+    sid       = "EvidenceWrite"
+    effect    = "Allow"
+    actions   = ["s3:PutObject", "s3:AbortMultipartUpload", "s3:CreateMultipartUpload", "s3:UploadPart", "s3:CompleteMultipartUpload", "s3:GetObject"]
     resources = ["${aws_s3_bucket.evidence.arn}/*"]
+  }
+  statement {
+    sid       = "EvidenceList"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.evidence.arn]
   }
   # DescribeCluster allows us to record cluster facts in evidence
   statement {
-    sid     = "DescribeEKS"
-    effect  = "Allow"
-    actions = ["eks:DescribeCluster"]
+    sid       = "DescribeEKS"
+    effect    = "Allow"
+    actions   = ["eks:DescribeCluster"]
     resources = ["*"]
   }
 }
@@ -49,7 +58,10 @@ resource "aws_iam_role_policy_attachment" "lambda_attach" {
 data "aws_iam_policy_document" "sfn_assume" {
   statement {
     actions = ["sts:AssumeRole"]
-    principals { type = "Service", identifiers = ["states.${local.region}.amazonaws.com"] }
+    principals {
+      type        = "Service"
+      identifiers = ["states.${local.region}.amazonaws.com"]
+    }
   }
 }
 
@@ -61,15 +73,15 @@ resource "aws_iam_role" "sfn_role" {
 
 data "aws_iam_policy_document" "sfn_policy" {
   statement {
-    sid     = "InvokeLambda"
-    effect  = "Allow"
-    actions = ["lambda:InvokeFunction","lambda:InvokeAsync"]
+    sid       = "InvokeLambda"
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction", "lambda:InvokeAsync"]
     resources = [aws_lambda_function.responder.arn]
   }
   statement {
-    sid     = "Logs"
-    effect  = "Allow"
-    actions = ["logs:CreateLogDelivery","logs:PutResourcePolicy","logs:DescribeResourcePolicies","logs:UpdateLogDelivery","logs:DeleteLogDelivery","logs:ListLogDeliveries"]
+    sid       = "Logs"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogDelivery", "logs:PutResourcePolicy", "logs:DescribeResourcePolicies", "logs:UpdateLogDelivery", "logs:DeleteLogDelivery", "logs:ListLogDeliveries"]
     resources = ["*"]
   }
 }

@@ -25,3 +25,33 @@ resource "aws_lambda_function" "responder" {
 
   tags = local.tags
 }
+
+resource "aws_lambda_function" "dashboard" {
+  function_name = "${local.name}-dashboard"
+  role          = aws_iam_role.lambda_exec.arn
+  filename      = data.archive_file.lambda_zip.output_path
+  handler       = "app.dashboard_handler"
+  runtime       = "python3.12"
+  timeout       = 10
+  memory_size   = 128
+
+  environment {
+    variables = {
+      EVIDENCE_BUCKET = aws_s3_bucket.evidence.bucket
+      AWS_REGION      = local.region
+      CLUSTER_NAME    = module.eks.cluster_name
+    }
+  }
+
+  tags = local.tags
+}
+
+resource "aws_lambda_function_url" "dashboard" {
+  function_name      = aws_lambda_function.dashboard.arn
+  authorization_type = "NONE"
+
+  cors {
+    allow_methods = ["GET"]
+    allow_origins = ["*"]
+  }
+}

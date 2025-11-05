@@ -2,20 +2,20 @@ resource "aws_cloudwatch_event_rule" "containment_request" {
   name        = "${local.name}-containment-request"
   description = "Kick off containment orchestrator"
   event_pattern = jsonencode({
-    "source":      ["demo.containment"],
-    "detail-type": ["NamespaceContainmentRequested"]
+    "source" : ["demo.containment"],
+    "detail-type" : ["NamespaceContainmentRequested"]
   })
   tags = local.tags
 }
 
 resource "aws_iam_role" "events_invoke_sfn" {
-  name               = "${local.name}-events-sfn-role"
+  name = "${local.name}-events-sfn-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17",
     Statement = [{
-      Effect = "Allow",
+      Effect    = "Allow",
       Principal = { Service = "events.amazonaws.com" },
-      Action = "sts:AssumeRole"
+      Action    = "sts:AssumeRole"
     }]
   })
   tags = local.tags
