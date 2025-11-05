@@ -51,9 +51,9 @@ module "eks" {
       ami_type       = "AL2_ARM_64"
       capacity_type  = "SPOT"
 
-      min_size     = 0
-      max_size     = 1
-      desired_size = 0
+      min_size     = 2
+      max_size     = 2
+      desired_size = 2
     }
   }
 

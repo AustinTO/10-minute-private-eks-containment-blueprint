@@ -34,7 +34,7 @@ resource "aws_sfn_state_machine" "containment" {
   logging_configuration {
     include_execution_data = true
     level                  = "ALL"
-    log_destination        = aws_cloudwatch_log_group.sfn.arn
+    log_destination        = "${aws_cloudwatch_log_group.sfn.arn}:*"
   }
 
   tags = local.tags

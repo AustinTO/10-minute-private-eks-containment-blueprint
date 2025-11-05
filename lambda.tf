@@ -17,7 +17,6 @@ resource "aws_lambda_function" "responder" {
     variables = {
       EVIDENCE_BUCKET = aws_s3_bucket.evidence.bucket
       CLUSTER_NAME    = module.eks.cluster_name
-      AWS_REGION      = local.region
     }
   }
 
@@ -38,7 +37,6 @@ resource "aws_lambda_function" "dashboard" {
   environment {
     variables = {
       EVIDENCE_BUCKET = aws_s3_bucket.evidence.bucket
-      AWS_REGION      = local.region
       CLUSTER_NAME    = module.eks.cluster_name
     }
   }
