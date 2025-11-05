@@ -13,7 +13,7 @@ data "aws_availability_zones" "available" {
 locals {
   base_name = replace(basename(path.cwd), "_", "-")
   name      = substr(local.base_name, 0, 25)
-  region    = "us-west-2"
+  region    = "us-east-1"
 
   vpc_cidr = "10.0.0.0/16"
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)

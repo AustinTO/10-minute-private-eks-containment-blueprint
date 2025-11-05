@@ -38,13 +38,42 @@ This project demonstrates how real-world cloud security engineers handle:
 - **Automated incident containment**
 - **Forensic evidence generation**
   
-Inspired by recent discussions of *AI-assisted attack simulation and role complexity* in modern AWS environments, this blueprint translates those theoretical challenges into something you can **deploy, observe, and extend**.
+Inspired by recent Cloud Security Podcast titled: Incident Response of Kubernetes and how to Automate Containment with guest Damien Burks and host Ashish Rajan. The project hopes to show a workable method in a modern IaC AWS environments, this blueprint translates those theoretical challenges into something you can **deploy, observe, and extend**.
 
 ---
 
 ### 🚀 Quick Start
 ```bash
-git clone https://github.com/<YOUR_USERNAME>/eks-containment-blueprint.git
+git clone https://github.com/AustinTO/eks-containment-blueprint.git
 cd eks-containment-blueprint
 terraform init
-terraform apply
+TF_LOG=ERROR terraform apply
+```
+
+---
+
+### ✅ Current State
+- Private EKS cluster provisioned via Terraform with the control plane and nodes isolated inside private subnets.
+- EventBridge rule, Step Functions state machine, and Lambda responder pipeline wired together — **Phase 1 focuses on evidence capture only (no live Kubernetes containment actions yet).**
+- Evidence artifacts (JSON snapshots) persisted to S3 alongside CloudWatch logs for both Lambda functions and the state machine.
+- Lightweight containment dashboard (Lambda Function URL) surfaces the latest run details without extra infrastructure.
+
+---
+
+### 🧪 Testing Plan
+1. **Provision** – Deploy with `TF_LOG=ERROR terraform apply` and wait for Terraform to finish.
+2. **Trigger** – Send the demo containment event through EventBridge (matches the `demo.containment` source configured in `events.tf`):
+   ```bash
+   aws events put-events --entries '[
+     {
+       "Source": "demo.containment",
+       "DetailType": "NamespaceContainmentRequested",
+       "Detail": "{\"namespace\":\"default\",\"reason\":\"phase1-test\"}",
+       "EventBusName": "default"
+     }
+   ]'
+   ```
+   Add `--region <aws-region>` or `--profile <name>` if needed.
+3. **Verify Evidence** – Confirm a `runs/<timestamp>/audit.json` object exists in the evidence bucket and review CloudWatch logs.
+4. **Check Dashboard** – Open the `dashboard_url` output in a browser to see the latest containment summary (expect evidence only in Phase 1).
+5. **Teardown (optional)** – Run `terraform destroy` when you’re finished to avoid ongoing AWS charges.
