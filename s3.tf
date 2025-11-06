@@ -4,6 +4,7 @@ locals {
 
 resource "aws_s3_bucket" "evidence" {
   bucket = "${local.name}-evidence-${random_id.evidence_suffix.hex}"
+  force_destroy = true
   tags   = local.tags
 }
 
