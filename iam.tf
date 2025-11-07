@@ -39,7 +39,13 @@ data "aws_iam_policy_document" "lambda_policy" {
   statement {
     sid       = "DescribeEKS"
     effect    = "Allow"
-    actions   = ["eks:DescribeCluster"]
+    actions   = ["eks:DescribeCluster", "eks:GetToken"]
+    resources = ["*"]
+  }
+  statement {
+    sid       = "LambdaVpcAccess"
+    effect    = "Allow"
+    actions   = ["ec2:CreateNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DeleteNetworkInterface"]
     resources = ["*"]
   }
 }

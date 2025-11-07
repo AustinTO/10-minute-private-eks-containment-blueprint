@@ -17,6 +17,7 @@ It extends that baseline into a **realistic incident-response and containment de
 - **IAM Role Complexity** – Demonstrates advanced AWS-to-Kubernetes identity bridging using `AccessEntries` instead of legacy `aws-auth` mappings.
 - **Evidence-Driven Response** – Each action produces verifiable artifacts (JSON snapshots, run records) for forensics and compliance.
 - **Network Isolation Challenges** – Shows how private Lambda, EKS, and Step Functions communicate through Interface VPC Endpoints—no internet, no NAT, no compromise.
+- **Phase 2 Containment** – A single Lambda function can now bootstrap its own Kubernetes RBAC and perform namespace-level containment (label pods, scale deployments) while remaining inside the private network.
 
 ---
 
@@ -52,11 +53,12 @@ TF_LOG=ERROR terraform apply
 
 ---
 
-### ✅ Current State
+### ✅ Current State (Phase 2 Complete)
 - Private EKS cluster provisioned via Terraform with the control plane and nodes isolated inside private subnets.
-- EventBridge rule, Step Functions state machine, and Lambda responder pipeline wired together — **Phase 1 focuses on evidence capture only (no live Kubernetes containment actions yet).**
-- Evidence artifacts (JSON snapshots) persisted to S3 alongside CloudWatch logs for both Lambda functions and the state machine.
-- Lightweight containment dashboard (Lambda Function URL) surfaces the latest run details without extra infrastructure.
+- EventBridge rule, Step Functions state machine, and Lambda responder pipeline wired together — **Phase 2 adds live containment with Lambda-driven RBAC bootstrap (ServiceAccount, ClusterRole, ClusterRoleBinding) and real namespace actions (label pods, scale deployments).**
+- Responder Lambda runs in private subnets, uses the EKS interface VPC endpoint, SigV4/STS token generation, and writes `audit.json` / `containment.json` evidence to S3; Dashboard Lambda stays public via a Function URL but reads the same evidence.
+- Lightweight containment dashboard surfaces the latest run details (audit or containment) without extra infrastructure.
+- **Operational learning:** debugging private Lambda networking, Lambda function URLs, interface VPC endpoints, and STS token generation in a fully-private cluster is now documented in this repo.
 
 ---
 
@@ -68,12 +70,20 @@ TF_LOG=ERROR terraform apply
      {
        "Source": "demo.containment",
        "DetailType": "NamespaceContainmentRequested",
-       "Detail": "{\"namespace\":\"default\",\"reason\":\"phase1-test\"}",
+       "Detail": "{\"namespace\":\"default\",\"reason\":\"phase2-test\",\"mode\":\"containment\"}",
        "EventBusName": "default"
      }
    ]'
    ```
    Add `--region <aws-region>` or `--profile <name>` if needed.
-3. **Verify Evidence** – Confirm a `runs/<timestamp>/audit.json` object exists in the evidence bucket and review CloudWatch logs.
-4. **Check Dashboard** – Open the `dashboard_url` output in a browser to see the latest containment summary (expect evidence only in Phase 1).
+3. **Verify Evidence** – Confirm a `runs/<timestamp>/containment.json` (or `audit.json`) object exists in the evidence bucket and review CloudWatch logs (look for `Calling Kubernetes API ...` lines).
+4. **Check Dashboard** – Open the `dashboard_url` output in a browser to see the latest run summary (audit or containment). Dashboard runs publicly; responder stays private.
 5. **Teardown (optional)** – Run `terraform destroy` when you’re finished to avoid ongoing AWS charges.
+
+---
+
+### 🧗 Phase 2 Challenges & Lessons Learned
+- **Lambda networking inside a private VPC** – Function URLs only work when the Lambda has public egress; the dashboard had to move back out of the VPC, while the responder stayed private and required an EKS interface endpoint plus explicit `lambda:InvokeFunctionUrl` permission.
+- **STS token generation** – Using `botocore.auth.SigV4Auth` directly avoided `botocore.session` API drift inside Lambda and produced the correct bearer token for the Kubernetes client.
+- **Lambda packaging & redeploys** – Terraform’s `archive_file` keeps a single ZIP (`.build/responder.zip`) for both handlers; delete it (or update code) before `terraform apply` to ensure new Python changes deploy.
+- **VPC Endpoints & IAM** – The responder’s IAM policy now includes `eks:GetToken` and ENI permissions; the EKS interface endpoint keeps containment traffic private without a NAT gateway.

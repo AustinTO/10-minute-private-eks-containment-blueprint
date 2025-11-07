@@ -10,6 +10,8 @@ data "aws_availability_zones" "available" {
   }
 }
 
+data "aws_partition" "current" {}
+
 locals {
   base_name = replace(basename(path.cwd), "_", "-")
   name      = substr(local.base_name, 0, 25)
@@ -54,6 +56,21 @@ module "eks" {
       min_size     = 2
       max_size     = 2
       desired_size = 2
+    }
+  }
+
+  access_entries = {
+    containment_lambda = {
+      principal_arn = aws_iam_role.lambda_exec.arn
+      type          = "STANDARD"
+      policy_associations = {
+        lambda_admin = {
+          policy_arn = "arn:${data.aws_partition.current.partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          access_scope = {
+            type = "cluster"
+          }
+        }
+      }
     }
   }
 
@@ -112,7 +129,7 @@ module "vpc_endpoints" {
       }
     }
     },
-    { for service in toset(["autoscaling", "ecr.api", "ecr.dkr", "ec2", "ec2messages", "elasticloadbalancing", "sts", "kms", "logs", "ssm", "ssmmessages"]) :
+    { for service in toset(["autoscaling", "ecr.api", "ecr.dkr", "ec2", "ec2messages", "elasticloadbalancing", "eks", "sts", "kms", "logs", "ssm", "ssmmessages"]) :
       replace(service, ".", "_") =>
       {
         service             = service
@@ -123,4 +140,31 @@ module "vpc_endpoints" {
   })
 
   tags = local.tags
+}
+
+resource "aws_security_group" "lambda" {
+  name        = "${local.name}-lambda"
+  description = "Lambda network access to private EKS endpoint"
+  vpc_id      = module.vpc.vpc_id
+
+  egress {
+    description      = "Allow all outbound traffic"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = merge(local.tags, { Name = "${local.name}-lambda" })
+}
+
+resource "aws_security_group_rule" "lambda_to_cluster" {
+  description              = "Allow Lambda to call the private cluster endpoint"
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = module.eks.cluster_security_group_id
+  source_security_group_id = aws_security_group.lambda.id
 }

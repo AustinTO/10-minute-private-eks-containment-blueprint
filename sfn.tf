@@ -16,7 +16,7 @@ locals {
           FunctionName = aws_lambda_function.responder.arn
           Payload = {
             "detail.$" = "$.detail"
-            "mode"     = "audit"
+            "mode.$"   = "$.detail.mode"
           }
         }
         OutputPath = "$.Payload"
