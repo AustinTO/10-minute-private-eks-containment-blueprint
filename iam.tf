@@ -1,3 +1,4 @@
+data "aws_caller_identity" "current" {}
 # Lambda execution role
 data "aws_iam_policy_document" "lambda_assume" {
   statement {
@@ -112,4 +113,52 @@ resource "aws_iam_policy" "sfn_policy" {
 resource "aws_iam_role_policy_attachment" "sfn_attach" {
   role       = aws_iam_role.sfn_role.name
   policy_arn = aws_iam_policy.sfn_policy.arn
+}
+
+# IAM Policy allowing the Bastion to read objects from the Evidence Bucket
+data "aws_iam_policy_document" "bastion_s3_read_doc" {
+  statement {
+    sid       = "AllowS3ReadEvidence"
+    effect    = "Allow"
+    # We only need GetObject to download the kubectl binary
+    actions   = ["s3:GetObject"]
+    # ⚠️ This resource must include /* to cover all files in the bucket
+    resources = ["${aws_s3_bucket.evidence.arn}/*"]
+  }
+}
+
+resource "aws_iam_policy" "bastion_s3_read" {
+  name   = "${local.name}-bastion-s3-read-policy"
+  policy = data.aws_iam_policy_document.bastion_s3_read_doc.json
+}
+
+# Attach the new read policy to the Bastion's IAM Role
+resource "aws_iam_role_policy_attachment" "bastion_s3_read_attach" {
+  role       = aws_iam_role.bastion.name
+  policy_arn = aws_iam_policy.bastion_s3_read.arn
+}
+
+# IAM Policy allowing the Bastion to read EKS cluster metadata
+data "aws_iam_policy_document" "bastion_eks_read_doc" {
+  statement {
+    sid       = "AllowEKSDescribe"
+    effect    = "Allow"
+    actions   = [
+      "eks:DescribeCluster",
+      "eks:GetToken" # Required for generating the Kubernetes token
+    ]
+    # Allow reading the cluster metadata
+    resources = ["arn:aws:eks:${local.region}:${data.aws_caller_identity.current.account_id}:cluster/${module.eks.cluster_name}"]
+  }
+}
+
+resource "aws_iam_policy" "bastion_eks_read" {
+  name   = "${local.name}-bastion-eks-read-policy"
+  policy = data.aws_iam_policy_document.bastion_eks_read_doc.json
+}
+
+# Attach the new EKS read policy to the Bastion's IAM Role
+resource "aws_iam_role_policy_attachment" "bastion_eks_read_attach" {
+  role       = aws_iam_role.bastion.name
+  policy_arn = aws_iam_policy.bastion_eks_read.arn
 }

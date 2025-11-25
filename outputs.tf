@@ -31,3 +31,8 @@ output "dashboard_url" {
   description = "Public URL for the Lambda containment dashboard"
   value       = aws_lambda_function_url.dashboard.function_url
 }
+
+output "bastion_instance_id" {
+  description = "Instance ID of the SSM-only bastion"
+  value       = aws_instance.bastion.id
+}

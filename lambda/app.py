@@ -8,56 +8,32 @@ from typing import Any, Dict, List
 
 import boto3
 import botocore.session
-from botocore.auth import SigV4Auth
-from botocore.awsrequest import AWSRequest
+from botocore.signers import RequestSigner
 import urllib3
 from urllib3.util import Timeout
 
 EVIDENCE_BUCKET = os.environ["EVIDENCE_BUCKET"]
 CLUSTER_NAME = os.environ["CLUSTER_NAME"]
-ROLE_ARN = os.environ.get("LAMBDA_ROLE_ARN", "")
-SERVICE_ACCOUNT_NAMESPACE = os.environ.get("RBAC_NAMESPACE", "kube-system")
-SERVICE_ACCOUNT_NAME = os.environ.get("RBAC_SERVICE_ACCOUNT", "containment-lambda")
-CLUSTER_ROLE_NAME = os.environ.get("RBAC_CLUSTER_ROLE", "containment-lambda")
-CLUSTER_ROLE_BINDING_NAME = os.environ.get("RBAC_CLUSTER_ROLE_BINDING", "containment-lambda")
-#test touch
-SESSION = boto3.session.Session()
-REGION = (
-    os.environ.get("AWS_REGION")
-    or os.environ.get("AWS_DEFAULT_REGION")
-    or SESSION.region_name
-    or "us-east-1"
-)
-
-s3 = SESSION.client("s3", region_name=REGION)
-eks = SESSION.client("eks", region_name=REGION)
-
-HTTP_TIMEOUT = Timeout(connect=3.0, read=10.0)
+REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-
-class ResourceNotFound(Exception):
-    pass
-
-
+# Initialize Clients inside handler to avoid freeze/thaw issues
 def handler(event, context):
+    # Standard Boto3 clients for non-auth ops
+    eks = boto3.client("eks", region_name=REGION)
+    s3 = boto3.client("s3", region_name=REGION)
+
     detail = (event or {}).get("detail") or {}
     mode = (event or {}).get("mode") or detail.get("mode") or "audit"
     ts = int(time.time())
 
     try:
         cluster = eks.describe_cluster(name=CLUSTER_NAME)["cluster"]
-    except Exception as exc:  # pragma: no cover - surfaced in evidence
+    except Exception as exc:
         logger.exception("Failed to describe cluster")
-        payload = {
-            "error": str(exc),
-            "request": {"mode": mode, "detail": detail, "ts": ts},
-        }
-        key = f"runs/{ts}/error.json"
-        put_evidence(key, payload)
-        return {"status": "error", "bucket": EVIDENCE_BUCKET, "key": key, "mode": mode}
+        return {"status": "error", "error": str(exc)}
 
     evidence = {
         "cluster": cluster_snapshot(cluster),
@@ -65,14 +41,18 @@ def handler(event, context):
     }
 
     if mode == "containment":
+        # We use the robust auth-loop logic here
         evidence["containment"] = run_containment(detail, cluster)
         key = f"runs/{ts}/containment.json"
     else:
         key = f"runs/{ts}/audit.json"
 
-    put_evidence(key, evidence)
+    s3.put_object(
+        Bucket=EVIDENCE_BUCKET,
+        Key=key,
+        Body=json.dumps(evidence, indent=2).encode("utf-8"),
+    )
     return {"status": "ok", "bucket": EVIDENCE_BUCKET, "key": key, "mode": mode}
-
 
 def cluster_snapshot(cluster: Dict[str, Any]) -> Dict[str, Any]:
     cfg = cluster.get("resourcesVpcConfig", {})
@@ -80,232 +60,128 @@ def cluster_snapshot(cluster: Dict[str, Any]) -> Dict[str, Any]:
         "name": cluster.get("name"),
         "status": cluster.get("status"),
         "version": cluster.get("version"),
-        "endpointPrivate": cfg.get("endpointPrivateAccess"),
-        "endpointPublic": cfg.get("endpointPublicAccess"),
+        "endpointPrivate": cfg.get("endpointPrivateAccess")
     }
-
-
-def put_evidence(key: str, body: Dict[str, Any]) -> None:
-    s3.put_object(
-        Bucket=EVIDENCE_BUCKET,
-        Key=key,
-        Body=json.dumps(body, indent=2).encode("utf-8"),
-    )
-
 
 def run_containment(detail: Dict[str, Any], cluster: Dict[str, Any]) -> Dict[str, Any]:
     namespace = detail.get("namespace") or "default"
     logger.info("Starting containment run for namespace=%s", namespace)
-    ca_path = write_ca_file(cluster["certificateAuthority"]["data"])
-    token = build_bearer_token(CLUSTER_NAME)
+    
+    endpoint = cluster["endpoint"].rstrip("/")
+    ca_data = cluster["certificateAuthority"]["data"]
+    
+    # Setup HTTP Client
+    ca_path = "/tmp/eks-ca.crt"
+    with open(ca_path, "wb") as f:
+        f.write(base64.b64decode(ca_data))
+    
     http = urllib3.PoolManager(
         cert_reqs="CERT_REQUIRED",
         ca_certs=ca_path,
-        timeout=HTTP_TIMEOUT,
+        timeout=Timeout(connect=3.0, read=10.0)
     )
-    endpoint = cluster["endpoint"].rstrip("/")
 
-    summary = {"namespace": namespace}
+    # === AUTHENTICATION LOOP (The Nuclear Logic) ===
+    # Attempt 1: Global
+    token = get_token(CLUSTER_NAME, force_regional=False)
+    if not test_auth(http, endpoint, token):
+        logger.warning("Global token failed auth check. Switching to Regional...")
+        
+        # Attempt 2: Regional
+        token = get_token(CLUSTER_NAME, force_regional=True)
+        if not test_auth(http, endpoint, token):
+            logger.error("Both Global and Regional tokens failed authentication.")
+            raise RuntimeError("FATAL: Unable to authenticate to EKS.")
+    
+    logger.info("Authentication successful. Proceeding to containment.")
 
-    try:
-        rbac = ensure_rbac(endpoint, http, token)
-        actions = perform_containment(endpoint, http, token, namespace)
-        summary.update({"status": "ok", "rbac": rbac, "actions": actions})
-    except Exception as exc:  # pragma: no cover - surfaced in evidence
-        logger.exception("Containment failed")
-        summary.update({"status": "error", "error": str(exc)})
+    # === EXECUTION ===
+    return perform_containment(http, endpoint, token, namespace)
 
-    return summary
+def get_token(cluster_id, force_regional=False):
+    """
+    Exact logic from the successful Diagnostic Script
+    """
+    session = botocore.session.get_session()
+    client = session.create_client("sts", region_name=REGION)
+    service_id = client.meta.service_model.service_id
+    
+    signer = RequestSigner(
+        service_id=service_id,
+        region_name=REGION,
+        signing_name="sts",
+        signature_version="v4",
+        credentials=client._request_signer._credentials,
+        event_emitter=session.get_component("event_emitter")
+    )
 
-
-def ensure_rbac(endpoint: str, http: urllib3.PoolManager, token: str) -> Dict[str, bool]:
-    results = {
-        "serviceAccountCreated": False,
-        "clusterRoleCreated": False,
-        "clusterRoleBindingCreated": False,
+    # Toggle endpoint based on strategy
+    sts_host = f"sts.{REGION}.amazonaws.com" if force_regional else "sts.amazonaws.com"
+    
+    params = {
+        "method": "GET",
+        "url": f"https://{sts_host}/?Action=GetCallerIdentity&Version=2011-06-15",
+        "body": {},
+        "headers": {"x-k8s-aws-id": cluster_id},
+        "context": {}
     }
 
-    # ServiceAccount
-    sa_path = f"/api/v1/namespaces/{SERVICE_ACCOUNT_NAMESPACE}/serviceaccounts/{SERVICE_ACCOUNT_NAME}"
-    if not resource_exists(endpoint, http, token, sa_path):
-        body = {
-            "apiVersion": "v1",
-            "kind": "ServiceAccount",
-            "metadata": {
-                "name": SERVICE_ACCOUNT_NAME,
-                "namespace": SERVICE_ACCOUNT_NAMESPACE,
-            },
-        }
-        if ROLE_ARN:
-            body["metadata"]["annotations"] = {"eks.amazonaws.com/role-arn": ROLE_ARN}
-        request(endpoint, http, token, "POST", f"/api/v1/namespaces/{SERVICE_ACCOUNT_NAMESPACE}/serviceaccounts", body)
-        results["serviceAccountCreated"] = True
+    url = signer.generate_presigned_url(
+        params, region_name=REGION, expires_in=60, operation_name=""
+    )
+    
+    # IMPORTANT: The prefix was missing in some previous versions.
+    base64_url = base64.urlsafe_b64encode(url.encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"k8s-aws-v1.{base64_url}"
 
-    # ClusterRole
-    cr_path = f"/apis/rbac.authorization.k8s.io/v1/clusterroles/{CLUSTER_ROLE_NAME}"
-    if not resource_exists(endpoint, http, token, cr_path):
-        body = {
-            "apiVersion": "rbac.authorization.k8s.io/v1",
-            "kind": "ClusterRole",
-            "metadata": {"name": CLUSTER_ROLE_NAME},
-            "rules": [
-                {
-                    "apiGroups": [""],
-                    "resources": ["pods"],
-                    "verbs": ["get", "list", "patch", "update"],
-                },
-                {
-                    "apiGroups": ["apps"],
-                    "resources": ["deployments"],
-                    "verbs": ["get", "list", "patch", "update"],
-                },
-            ],
-        }
-        request(endpoint, http, token, "POST", "/apis/rbac.authorization.k8s.io/v1/clusterroles", body)
-        results["clusterRoleCreated"] = True
-
-    # ClusterRoleBinding
-    crb_path = f"/apis/rbac.authorization.k8s.io/v1/clusterrolebindings/{CLUSTER_ROLE_BINDING_NAME}"
-    if not resource_exists(endpoint, http, token, crb_path):
-        body = {
-            "apiVersion": "rbac.authorization.k8s.io/v1",
-            "kind": "ClusterRoleBinding",
-            "metadata": {"name": CLUSTER_ROLE_BINDING_NAME},
-            "roleRef": {
-                "apiGroup": "rbac.authorization.k8s.io",
-                "kind": "ClusterRole",
-                "name": CLUSTER_ROLE_NAME,
-            },
-            "subjects": [
-                {
-                    "kind": "ServiceAccount",
-                    "name": SERVICE_ACCOUNT_NAME,
-                    "namespace": SERVICE_ACCOUNT_NAMESPACE,
-                }
-            ],
-        }
-        request(endpoint, http, token, "POST", "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings", body)
-        results["clusterRoleBindingCreated"] = True
-
-    return results
-
-
-def perform_containment(
-    endpoint: str, http: urllib3.PoolManager, token: str, namespace: str
-) -> Dict[str, Any]:
-    pods_endpoint = f"/api/v1/namespaces/{namespace}/pods"
-    deployments_endpoint = f"/apis/apps/v1/namespaces/{namespace}/deployments"
-
-    pods = request(endpoint, http, token, "GET", pods_endpoint).get("items", [])
-    deployments = request(endpoint, http, token, "GET", deployments_endpoint).get("items", [])
-
-    labeled_pods: List[str] = []
-    for pod in pods:
-        pod_name = pod["metadata"]["name"]
-        labels = pod["metadata"].get("labels") or {}
-        if labels.get("containment") == "true":
-            continue
-        patch = {"metadata": {"labels": {"containment": "true"}}}
-        request(
-            endpoint,
-            http,
-            token,
-            "PATCH",
-            f"{pods_endpoint}/{pod_name}",
-            body=patch,
-            content_type="application/merge-patch+json",
-        )
-        labeled_pods.append(pod_name)
-
-    scaled_deployments: List[Dict[str, Any]] = []
-    for dep in deployments:
-        dep_name = dep["metadata"]["name"]
-        replicas = (dep.get("spec") or {}).get("replicas", 0)
-        if replicas == 0:
-            continue
-        patch = {"spec": {"replicas": 0}}
-        request(
-            endpoint,
-            http,
-            token,
-            "PATCH",
-            f"{deployments_endpoint}/{dep_name}",
-            body=patch,
-            content_type="application/merge-patch+json",
-        )
-        scaled_deployments.append({"name": dep_name, "previousReplicas": replicas})
-
-    return {"podsLabeled": labeled_pods, "deploymentsScaled": scaled_deployments}
-
-
-def resource_exists(endpoint: str, http: urllib3.PoolManager, token: str, path: str) -> bool:
+def test_auth(http, endpoint, token):
+    """
+    Probes the API to see if the token is accepted.
+    """
+    url = f"{endpoint}/api/v1"
+    headers = {"Authorization": f"Bearer {token}"}
     try:
-        request(endpoint, http, token, "GET", path)
-        return True
-    except ResourceNotFound:
+        r = http.request("GET", url, headers=headers)
+        if r.status == 200:
+            return True
+        logger.warning(f"Auth Check Failed: {r.status} {r.data}")
+        return False
+    except Exception as e:
+        logger.warning(f"Auth Check Exception: {e}")
         return False
 
-
-def request(
-    endpoint: str,
-    http: urllib3.PoolManager,
-    token: str,
-    method: str,
-    path: str,
-    body: Dict[str, Any] | None = None,
-    content_type: str = "application/json",
-) -> Dict[str, Any]:
-    url = f"{endpoint}{path}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
+def perform_containment(http, endpoint, token, namespace):
+    policy_name = "quarantine-deny-all"
+    url = f"{endpoint}/apis/networking.k8s.io/v1/namespaces/{namespace}/networkpolicies"
+    
+    policy = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": policy_name, "namespace": namespace},
+        "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
     }
-    data = None
-    if body is not None:
-        headers["Content-Type"] = content_type
-        data = json.dumps(body).encode("utf-8")
 
-    logger.info("Calling Kubernetes API %s %s", method, path)
-    response = http.request(method, url, body=data, headers=headers)
-
-    if response.status == 404:
-        raise ResourceNotFound(path)
-    if response.status >= 400:
-        raise RuntimeError(f"Kubernetes API {method} {path} failed: {response.status} {response.data}")
-
-    if response.data:
-        return json.loads(response.data)
-    return {}
-
-
-def write_ca_file(encoded: str) -> str:
-    ca_path = "/tmp/eks-ca.crt"
-    with open(ca_path, "wb") as fh:
-        fh.write(base64.b64decode(encoded))
-    return ca_path
-
-
-def build_bearer_token(cluster_name: str) -> str:
-    botocore_session = botocore.session.Session()
-    botocore_session.set_config_variable("region", REGION)
-    creds = botocore_session.get_credentials().get_frozen_credentials()
-
-    url = f"https://sts.{REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15"
-    request = AWSRequest(method="GET", url=url)
-    request.headers["x-k8s-aws-id"] = cluster_name
-
-    SigV4Auth(creds, "sts", REGION).add_auth(request)
-    signed = request.prepare()
-    signed_url = signed.url
-
-    token = base64.urlsafe_b64encode(signed_url.encode("utf-8")).decode("utf-8").rstrip("=")
-    return f"k8s-aws-v1.{token}"
-
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    
+    try:
+        response = http.request("POST", url, body=json.dumps(policy).encode("utf-8"), headers=headers)
+        
+        if response.status in [200, 201]:
+            logger.info("CONTAINMENT SUCCESS: Policy Created")
+            return {"status": "Containment Applied", "policy": policy_name}
+        elif response.status == 409:
+            logger.info("CONTAINMENT SUCCESS: Policy Already Exists")
+            return {"status": "Already Contained", "policy": policy_name}
+        else:
+            logger.error(f"K8s Error Body: {response.data.decode('utf-8')}")
+            raise RuntimeError(f"Failed: {response.status} {response.data}")
+            
+    except Exception as e:
+        logger.exception("Policy creation failed")
+        return {"status": "Error", "error": str(e)}
 
 def dashboard_handler(event, context):
-    """
-    Lambda Function URL entrypoint; renders a tiny HTML view of the most recent run.
-    """
+    s3 = boto3.client("s3", region_name=REGION)
     latest = None
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=EVIDENCE_BUCKET, Prefix="runs/"):
@@ -315,17 +191,7 @@ def dashboard_handler(event, context):
                 latest = obj
 
     if not latest:
-        body = """
-        <!doctype html>
-        <html>
-          <head><title>Containment Dashboard</title></head>
-          <body>
-            <h1>Containment Dashboard</h1>
-            <p>No containment runs have been recorded yet.</p>
-          </body>
-        </html>
-        """
-        return {"statusCode": 200, "headers": {"Content-Type": "text/html"}, "body": body}
+        return {"statusCode": 200, "headers": {"Content-Type": "text/html"}, "body": "<h1>No runs yet</h1>"}
 
     obj = s3.get_object(Bucket=EVIDENCE_BUCKET, Key=latest["Key"])
     payload = json.loads(obj["Body"].read())
@@ -333,47 +199,31 @@ def dashboard_handler(event, context):
     run_ts = payload.get("request", {}).get("ts")
     run_time = datetime.utcfromtimestamp(run_ts).strftime("%Y-%m-%d %H:%M:%SZ") if run_ts else "unknown"
     mode = payload.get("request", {}).get("mode", "audit")
-    status = payload.get("cluster", {}).get("status", "unknown")
-    version = payload.get("cluster", {}).get("version", "unknown")
-    endpoint_private = payload.get("cluster", {}).get("endpointPrivate")
-    endpoint_public = payload.get("cluster", {}).get("endpointPublic")
+    
+    containment_info = payload.get("containment", {})
+    status_text = containment_info.get("status", "N/A")
+    policy = containment_info.get("policy", "N/A")
+
+    # CSS classes moved to simple logic to avoid syntax error
+    color_style = "color: green;"
+    if "Applied" in status_text or "Contained" in status_text:
+        color_style = "color: red;"
 
     body = f"""
     <!doctype html>
     <html>
-      <head>
-        <title>Containment Dashboard</title>
-        <style>
-          body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #f7fafc; color: #1a202c; }}
-          .card {{ background: white; padding: 1.5rem; border-radius: 0.75rem; box-shadow: 0 10px 30px -10px rgba(15, 23, 42, 0.25); max-width: 28rem; }}
-          h1 {{ margin-bottom: 1rem; font-size: 1.75rem; }}
-          dl {{ margin: 0; }}
-          dt {{ font-weight: 600; margin-top: 0.75rem; }}
-          dd {{ margin: 0.25rem 0 0; }}
-          footer {{ margin-top: 2rem; font-size: 0.85rem; color: #4a5568; }}
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>Latest run</h1>
-          <dl>
-            <dt>Run time</dt>
-            <dd>{run_time}</dd>
-            <dt>Mode</dt>
-            <dd>{mode}</dd>
-            <dt>Cluster status</dt>
-            <dd>{status}</dd>
-            <dt>EKS version</dt>
-            <dd>{version}</dd>
-            <dt>Private endpoint</dt>
-            <dd>{endpoint_private}</dd>
-            <dt>Public endpoint</dt>
-            <dd>{endpoint_public}</dd>
-          </dl>
-          <footer>Evidence object: <code>{latest["Key"]}</code></footer>
+      <head><title>Containment Dashboard</title></head>
+      <body style="font-family: sans-serif; margin: 2rem;">
+        <div style="border: 1px solid #ccc; padding: 20px; border-radius: 8px; max-width: 600px;">
+          <h1>Latest Run</h1>
+          <p><strong>Time:</strong> {run_time}</p>
+          <p><strong>Mode:</strong> {mode}</p>
+          <p><strong>Status:</strong> <span style="{color_style}">{status_text}</span></p>
+          <p><strong>Policy:</strong> {policy}</p>
+          <hr>
+          <small>Evidence: {latest["Key"]}</small>
         </div>
       </body>
     </html>
     """
-
     return {"statusCode": 200, "headers": {"Content-Type": "text/html"}, "body": body}
