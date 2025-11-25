@@ -12,6 +12,10 @@ data "aws_availability_zones" "available" {
 
 data "aws_partition" "current" {}
 
+data "aws_ssm_parameter" "al2023_ami" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
+}
+
 locals {
   base_name = replace(basename(path.cwd), "_", "-")
   name      = substr(local.base_name, 0, 25)
@@ -35,13 +39,17 @@ module "eks" {
   version = "~> 20.11"
 
   cluster_name    = local.name
-  cluster_version = "1.31"
+  cluster_version = "1.32"
 
   # EKS Addons
   cluster_addons = {
     coredns    = {}
     kube-proxy = {}
-    vpc-cni    = {}
+    vpc-cni = {
+      configuration_values = jsonencode({
+        enableNetworkPolicy = "true"
+      })
+    }
   }
 
   vpc_id     = module.vpc.vpc_id
@@ -49,8 +57,8 @@ module "eks" {
 
   eks_managed_node_groups = {
     initial = {
-      instance_types = ["t4g.small"]
-      ami_type       = "AL2_ARM_64"
+      instance_types = ["t3.small"]
+      ami_type       = "AL2_x86_64"
       capacity_type  = "SPOT"
 
       min_size     = 2
@@ -167,4 +175,72 @@ resource "aws_security_group_rule" "lambda_to_cluster" {
   protocol                 = "tcp"
   security_group_id        = module.eks.cluster_security_group_id
   source_security_group_id = aws_security_group.lambda.id
+}
+
+################################################################################
+# Bastion (SSM-only)
+################################################################################
+
+resource "aws_security_group" "bastion" {
+  name        = "${local.name}-bastion"
+  description = "Isolated bastion used only via SSM"
+  vpc_id      = module.vpc.vpc_id
+
+  egress {
+    description      = "Allow all outbound traffic"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = merge(local.tags, { Name = "${local.name}-bastion" })
+}
+
+resource "aws_security_group_rule" "bastion_to_cluster" {
+  description              = "Allow bastion to reach the EKS cluster API"
+  type                     = "ingress"
+  from_port                = 443
+  to_port                  = 443
+  protocol                 = "tcp"
+  security_group_id        = module.eks.cluster_security_group_id
+  source_security_group_id = aws_security_group.bastion.id
+}
+
+resource "aws_iam_role" "bastion" {
+  name = "${local.name}-bastion"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect    = "Allow"
+        Principal = { Service = "ec2.amazonaws.com" }
+        Action    = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "bastion_ssm" {
+  role       = aws_iam_role.bastion.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "bastion" {
+  name = "${local.name}-bastion"
+  role = aws_iam_role.bastion.name
+}
+
+resource "aws_instance" "bastion" {
+  ami                         = data.aws_ssm_parameter.al2023_ami.value
+  instance_type               = "t3.nano"
+  subnet_id                   = module.vpc.private_subnets[0]
+  vpc_security_group_ids      = [aws_security_group.bastion.id]
+  iam_instance_profile        = aws_iam_instance_profile.bastion.name
+  associate_public_ip_address = false
+
+  tags = merge(local.tags, { Name = "${local.name}-bastion" })
 }

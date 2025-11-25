@@ -8,16 +8,16 @@ It extends that baseline into a **realistic incident-response and containment de
 ---
 
 ### 🧩 What It Does
-- **Private EKS Cluster** – based on AWS’ “Fully Private Cluster” pattern (no public endpoint, no NAT).
-- **Containment Automation** – EventBridge → Step Functions → Lambda workflow that can:
+- **Private EKS Cluster** - based on AWS’ “Fully Private Cluster” pattern (no public endpoint, no NAT).
+- **Containment Automation** - EventBridge → Step Functions → Lambda workflow that can:
   - Label and quarantine namespaces.
   - Apply default-deny `NetworkPolicy` rules.
   - Scale down or annotate compromised workloads.
   - Capture before/after state to S3 for audit.
-- **IAM Role Complexity** – Demonstrates advanced AWS-to-Kubernetes identity bridging using `AccessEntries` instead of legacy `aws-auth` mappings.
-- **Evidence-Driven Response** – Each action produces verifiable artifacts (JSON snapshots, run records) for forensics and compliance.
-- **Network Isolation Challenges** – Shows how private Lambda, EKS, and Step Functions communicate through Interface VPC Endpoints—no internet, no NAT, no compromise.
-- **Phase 2 Containment** – A single Lambda function can now bootstrap its own Kubernetes RBAC and perform namespace-level containment (label pods, scale deployments) while remaining inside the private network.
+- **IAM Role Complexity** - Demonstrates advanced AWS-to-Kubernetes identity bridging using `AccessEntries` instead of legacy `aws-auth` mappings.
+- **Evidence-Driven Response** - Each action produces verifiable artifacts (JSON snapshots, run records) for forensics and compliance.
+- **Network Isolation Challenges** - Shows how private Lambda, EKS, and Step Functions communicate through Interface VPC Endpoints with no internet, no NAT, from the get go.
+- **Phase 2 Containment** - PRIOR TO PHASE 3 IMPLEMENTATION: A single Lambda function would bootstrap its own Kubernetes RBAC and perform namespace-level containment (label pods, scale deployments) while remaining inside the private network. 
 
 ---
 
@@ -53,37 +53,102 @@ TF_LOG=ERROR terraform apply
 
 ---
 
-### ✅ Current State (Phase 2 Complete)
-- Private EKS cluster provisioned via Terraform with the control plane and nodes isolated inside private subnets.
-- EventBridge rule, Step Functions state machine, and Lambda responder pipeline wired together — **Phase 2 adds live containment with Lambda-driven RBAC bootstrap (ServiceAccount, ClusterRole, ClusterRoleBinding) and real namespace actions (label pods, scale deployments).**
-- Responder Lambda runs in private subnets, uses the EKS interface VPC endpoint, SigV4/STS token generation, and writes `audit.json` / `containment.json` evidence to S3; Dashboard Lambda stays public via a Function URL but reads the same evidence.
-- Lightweight containment dashboard surfaces the latest run details (audit or containment) without extra infrastructure.
-- **Operational learning:** debugging private Lambda networking, Lambda function URLs, interface VPC endpoints, and STS token generation in a fully-private cluster is now documented in this repo.
+### ✅ Current State (Phase 3: The Digital Cage)
+- Fully private EKS cluster (no internet gateway, no public endpoint) with Lambda/Step Functions/EventBridge traffic pinned to interface endpoints (S3, ECR, STS, Logs).
+- Event-driven containment that injects a **deny-all NetworkPolicy** to isolate pods while keeping them alive for RAM forensics.
+- Lambda responder authenticates with a manually constructed SigV4 STS token, prepends the required `k8s-aws-v1.` prefix, and targets the regional STS endpoint to satisfy EKS validation.
+- Access control is fully declarative via `aws_eks_access_entry` + `aws_eks_access_policy_association`-no `aws-auth` ConfigMap drift, cluster-admin granted in IaC for bastion and Lambda roles.
+- Uptime Kuma stays private; validation happens through a chained SSM → bastion → `kubectl port-forward` tunnel (no ingress, no load balancer).
+- End-to-end detection-to-containment completes in under 40 seconds; evidence is written to S3 as `audit.json` / `containment.json` but only viewable via either bastion port forwarding chain, or via s3 or containment s3 dashboard(lambda reading s3).
+
+
+### 🧭 Phase 3 Technical Deep Dive
+**Architectural goal:** forensic-grade, event-driven containment inside a strictly private Kubernetes cluster with no public endpoints, no internet egress, no NAT.
+
+**Core constraints**
+- Dark site networking; all outbound traffic forced through interface endpoints.
+- No inbound management: no SSH, no ingress controllers, no load balancers.
+- Containment must be non-destructive to preserve memory and process evidence.
+
+**Engineering challenges & solutions**
+1) **Bootstrapping tools without internet**  
+   - Problem: Bastion needed `kubectl` but could not `curl` over the internet.  
+   - Solution: Use the S3 VPC Endpoint as a private transfer path, download binary locally → upload to private bucket → bastion pulls via `aws s3 cp` using its IAM role and backbone routing.
+
+2) **Private image supply chain**  
+   - Problem: Nodes hit `ImagePullBackOff` without Docker Hub access.  
+   - Solution: Pull images locally, retag for private ECR, push with AWS CLI; manifests reference only private ECR URIs so kubelets pull through the ECR interface endpoint.
+
+3) **EKS authentication fixes**  
+   - Problems: Lambda runtime botocore drift, missing `k8s-aws-v1.` prefix, stale sessions across warm starts.  
+   - Fixes: Construct `RequestSigner` manually, inject the `k8s-aws-v1.` prefix, pin signing to regional STS (`sts.us-east-1.amazonaws.com`), and move `boto3.Session` creation inside the handler for fresh credentials per invocation.
+
+4) **RBAC automation without `aws-auth`**  
+   - Problem: Legacy ConfigMap was brittle and race-prone during Terraform applies.  
+   - Solution: Use `aws_eks_access_entry` + `aws_eks_access_policy_association` so bastion and Lambda roles receive cluster-admin at creation and survive destroy/apply cycles with zero manual steps.
+
+5) **Private observability path**  
+   - Problem: Validate containment state beyond just the s3 log and dashboard (Green to Red) without exposing the dashboard.  
+   - Solution: Daisy-chain tunnels: bastion runs `kubectl port-forward` to loopback; laptop bridges via `aws ssm start-session`, yielding `http://localhost:3001` locally with no new ingress.
+
+### 🐞 Troubleshooting Deep Dive: zombie container
+- Incident: Uptime Kuma showed the `vulnerables/web-dvwa` target as down while Kubernetes reported Running.  
+- Network checks: Service existed on port 80; endpoints present.  
+- Connectivity test: `kubectl exec` curl to the Pod IP timed out (handshake reached the container, no HTTP response), ruling out SG or NetworkPolicy drops.  
+- Root cause: DVWA image waited forever for a missing MySQL dependency, leaving the socket open but unresponsive.  
+- Fix: Swapped DVWA for a stateless Nginx (Alpine) image; dashboard flipped green, proving the network path was fine.  
+- Next: Replace with a sidecar-based honey pod (vulnerable app + local MySQL) for realistic exploits.
+
+### 🔮 Phase 4 plan: runtime detection and stateful architectures
+1) Stateful vulnerable workload (sidecar pattern)  
+   - Single Deployment with two containers: `vulnerables/web-dvwa` on port 80 and `mysql:5.7` on localhost:3306.  
+   - Frontend talks to MySQL over 127.0.0.1; removes the zombie state by supplying the dependency locally.  
+2) Automated threat detection (Falco + Sidekick)  
+   - Falco DaemonSet plus Sidekick to ship Critical alerts (e.g., terminal shell) to EventBridge.  
+   - Flow: shell in honey pod -> Falco syscall alert -> EventBridge -> Lambda containment.  
+3) Automated forensic snapshotting  
+   - IAM adds `ec2:CreateSnapshot` and `ec2:DescribeInstances`.  
+   - Lambda maps compromised Pod to node and EBS volume, then snapshots with `CaseID` and `Reason=Automated_Containment`.  
+4) VPC Flow Log analysis  
+   - Enable Flow Logs on private subnets; query in Athena to confirm traffic to the compromised IP drops after containment.  
+Execution order: deploy the multi-container pod, install Falco and verify it catches `kubectl exec`, wire Sidekick to EventBridge, then add snapshotting to Lambda.
+
+**Auth logic (Python)**  
+```python
+signer = RequestSigner(
+    service_id=client.meta.service_model.service_id,
+    region_name="us-east-1",
+    signing_name="sts",
+    # ... credentials ...
+)
+return f"k8s-aws-v1.{base64_url}"  # required prefix or EKS rejects the token
+```
+
+**IAM (Terraform)**  
+```hcl
+resource "aws_eks_access_policy_association" "lambda_admin" {
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+  principal_arn = aws_iam_role.lambda_exec.arn
+  access_scope  { type = "cluster" }
+}
+```
 
 ---
 
-### 🧪 Testing Plan
-1. **Provision** – Deploy with `TF_LOG=ERROR terraform apply` and wait for Terraform to finish.
-2. **Trigger** – Send the demo containment event through EventBridge (matches the `demo.containment` source configured in `events.tf`):
+### 🧪 Testing Plan (Phase 3)
+1. **Provision** - `TF_LOG=ERROR terraform apply` and wait for completion; ensure interface endpoints (S3/ECR/STS/Logs) exist.  
+2. **Trigger** - Send the containment event:
    ```bash
    aws events put-events --entries '[
      {
        "Source": "demo.containment",
        "DetailType": "NamespaceContainmentRequested",
-       "Detail": "{\"namespace\":\"default\",\"reason\":\"phase2-test\",\"mode\":\"containment\"}",
+       "Detail": "{\"namespace\":\"default\",\"reason\":\"phase3-test\",\"mode\":\"containment\"}",
        "EventBusName": "default"
      }
    ]'
    ```
-   Add `--region <aws-region>` or `--profile <name>` if needed.
-3. **Verify Evidence** – Confirm a `runs/<timestamp>/containment.json` (or `audit.json`) object exists in the evidence bucket and review CloudWatch logs (look for `Calling Kubernetes API ...` lines).
-4. **Check Dashboard** – Open the `dashboard_url` output in a browser to see the latest run summary (audit or containment). Dashboard runs publicly; responder stays private.
-5. **Teardown (optional)** – Run `terraform destroy` when you’re finished to avoid ongoing AWS charges.
-
----
-
-### 🧗 Phase 2 Challenges & Lessons Learned
-- **Lambda networking inside a private VPC** – Function URLs only work when the Lambda has public egress; the dashboard had to move back out of the VPC, while the responder stayed private and required an EKS interface endpoint plus explicit `lambda:InvokeFunctionUrl` permission.
-- **STS token generation** – Using `botocore.auth.SigV4Auth` directly avoided `botocore.session` API drift inside Lambda and produced the correct bearer token for the Kubernetes client.
-- **Lambda packaging & redeploys** – Terraform’s `archive_file` keeps a single ZIP (`.build/responder.zip`) for both handlers; delete it (or update code) before `terraform apply` to ensure new Python changes deploy.
-- **VPC Endpoints & IAM** – The responder’s IAM policy now includes `eks:GetToken` and ENI permissions; the EKS interface endpoint keeps containment traffic private without a NAT gateway.
+3. **Verify Evidence** - Check S3 for `runs/<ts>/containment.json` (or `audit.json`) and CloudWatch Logs for “Authentication successful” plus “Policy Created.”  
+4. **Validate Containment** - From the bastion run `kubectl describe networkpolicy quarantine-deny-all -n default`; the policy should exist while pods remain alive.  
+5. **Dashboard (dark tunnel)** - Start `kubectl port-forward` on the bastion to `:3001`, then bridge via `aws ssm start-session` to reach `http://localhost:3001` locally with no public ingress required.  
+6. **Teardown (optional)** - `terraform destroy` when finished.

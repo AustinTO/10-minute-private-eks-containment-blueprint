@@ -1,0 +1,146 @@
+import base64
+import json
+import logging
+import os
+import boto3
+import botocore.session
+from botocore.signers import RequestSigner
+import urllib3
+from urllib3.util import Timeout
+
+CLUSTER_NAME = os.environ["CLUSTER_NAME"]
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+EVIDENCE_BUCKET = os.environ["EVIDENCE_BUCKET"]
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+eks = boto3.client("eks", region_name=REGION)
+s3 = boto3.client("s3", region_name=REGION)
+HTTP_TIMEOUT = Timeout(connect=3.0, read=10.0)
+
+def handler(event, context):
+    logger.info("=== STARTING DIAGNOSTIC RUN ===")
+    
+    # 1. Describe Cluster to get Endpoint and CA
+    try:
+        cluster = eks.describe_cluster(name=CLUSTER_NAME)["cluster"]
+        endpoint = cluster["endpoint"]
+        ca_data = cluster["certificateAuthority"]["data"]
+        logger.info(f"Cluster Endpoint: {endpoint}")
+    except Exception as e:
+        logger.error(f"Failed to describe cluster: {e}")
+        return {"status": "failed_describe"}
+
+    # 2. Setup HTTP Client
+    ca_path = "/tmp/eks-ca.crt"
+    with open(ca_path, "wb") as f:
+        f.write(base64.b64decode(ca_data))
+    
+    http = urllib3.PoolManager(
+        cert_reqs="CERT_REQUIRED",
+        ca_certs=ca_path,
+        timeout=HTTP_TIMEOUT
+    )
+
+    # 3. GENERATE TOKENS (Global vs Regional)
+    # We will try BOTH to see which one EKS accepts
+    token_global = get_token(CLUSTER_NAME, force_regional=False)
+    token_regional = get_token(CLUSTER_NAME, force_regional=True)
+
+    # 4. PROBE THE API
+    # Try hitting a harmless endpoint (version) to test auth
+    api_path = f"{endpoint}/api/v1/namespaces"
+    
+    logger.info("--- ATTEMPT 1: Global STS Token ---")
+    success_global = test_connection(http, api_path, token_global)
+    
+    logger.info("--- ATTEMPT 2: Regional STS Token ---")
+    success_regional = test_connection(http, api_path, token_regional)
+
+    if success_global or success_regional:
+        logger.info(">>> AUTH SUCCESS! PROCEEDING TO CONTAINMENT <<<")
+        # Use the working token for the real logic
+        valid_token = token_global if success_global else token_regional
+        return run_real_logic(http, endpoint, valid_token)
+    else:
+        logger.error(">>> ALL AUTH ATTEMPTS FAILED <<<")
+        return {"status": "auth_failed"}
+
+def get_token(cluster_id, force_regional=False):
+    session = botocore.session.get_session()
+    client = session.create_client("sts", region_name=REGION)
+    service_id = client.meta.service_model.service_id
+    
+    signer = RequestSigner(
+        service_id=service_id,
+        region_name=REGION,
+        signing_name="sts",
+        signature_version="v4",
+        credentials=client._request_signer._credentials,
+        event_emitter=session.get_component("event_emitter")
+    )
+
+    # Construct Host
+    sts_host = f"sts.{REGION}.amazonaws.com" if force_regional else "sts.amazonaws.com"
+    
+    params = {
+        "method": "GET",
+        "url": f"https://{sts_host}/?Action=GetCallerIdentity&Version=2011-06-15",
+        "body": {},
+        "headers": {"x-k8s-aws-id": cluster_id},
+        "context": {}
+    }
+
+    url = signer.generate_presigned_url(
+        params, region_name=REGION, expires_in=60, operation_name=""
+    )
+    base64_url = base64.urlsafe_b64encode(url.encode("utf-8")).decode("utf-8").rstrip("=")
+    return f"k8s-aws-v1.{base64_url}"
+
+def test_connection(http, url, token):
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        r = http.request("GET", url, headers=headers)
+        logger.info(f"Status: {r.status}")
+        if r.status == 200:
+            logger.info("SUCCESS: Authenticated.")
+            return True
+        else:
+            logger.error(f"FAILED: {r.data}")
+            return False
+    except Exception as e:
+        logger.error(f"EXCEPTION: {e}")
+        return False
+
+def run_real_logic(http, endpoint, token):
+    # Simplified Containment Logic from original script
+    # 1. Ensure RBAC (ClusterRole for NetworkPolicy)
+    # 2. Create NetworkPolicy
+    logger.info("Applying Containment Logic...")
+    
+    # Define Policy
+    policy = {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {"name": "quarantine-deny-all", "namespace": "demo-apps"},
+        "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]}
+    }
+    
+    # Apply
+    url = f"{endpoint}/apis/networking.k8s.io/v1/namespaces/demo-apps/networkpolicies"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    
+    r = http.request("POST", url, body=json.dumps(policy).encode("utf-8"), headers=headers)
+    
+    if r.status in [200, 201]:
+        logger.info("CONTAINMENT APPLIED: Network Policy Created")
+        return {"status": "success", "action": "policy_created"}
+    elif r.status == 409:
+        logger.info("CONTAINMENT APPLIED: Policy Already Existed")
+        return {"status": "success", "action": "already_exists"}
+    else:
+        logger.error(f"CONTAINMENT FAILED: {r.status} {r.data}")
+        return {"status": "error", "code": r.status}
+
+def dashboard_handler(event, context):
+    return {"statusCode": 200, "body": "OK"}
