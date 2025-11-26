@@ -20,6 +20,108 @@ It extends that baseline into a **realistic incident-response and containment de
 - **Phase 2 Containment** - PRIOR TO PHASE 3 IMPLEMENTATION: A single Lambda function would bootstrap its own Kubernetes RBAC and perform namespace-level containment (label pods, scale deployments) while remaining inside the private network. 
 
 ---
+'''mermaid
+graph TD
+    %% --- Styling ---
+    classDef net fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#01579b;
+    classDef aws fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef compute fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef security fill:#ffebee,stroke:#c62828,stroke-width:2px;
+    classDef external fill:#f3e5f5,stroke:#4a148c,stroke-width:2px;
+
+    %% --- External World ---
+    subgraph Public_Internet ["☁️ Public Internet / Local Machine"]
+        User([User / Laptop])
+        Ext_Docker[Docker Hub]
+    end
+
+    %% --- AWS Cloud Boundary ---
+    subgraph AWS_Cloud ["☁️ AWS Cloud (us-east-1)"]
+        
+        %% --- AWS Managed Control Plane (Outside VPC) ---
+        subgraph AWS_Managed ["AWS Managed Services"]
+            EKS_CP[("🛡️ EKS Control Plane")]
+            ECR[("📦 Private ECR")]
+            S3_Bucket[("🗄️ Evidence S3 Bucket")]
+            EB[⚡ EventBridge]
+            SFN[⚙️ Step Functions]
+            STS[🔑 AWS STS]
+        end
+
+        %% --- The Private VPC ---
+        subgraph VPC ["🔒 Strictly Private VPC (No IGW/NAT)"]
+            style VPC fill:#f5f5f5,stroke:#666,stroke-width:2px,stroke-dasharray: 5 5
+
+            %% --- VPC Endpoints (The Only Way Out) ---
+            subgraph VPC_Endpoints ["Gateway & Interface Endpoints"]
+                VPCE_S3(VPCE: S3 Gateway)
+                VPCE_ECR(VPCE: ECR API/DKR)
+                VPCE_EKS(VPCE: EKS API)
+                VPCE_STS(VPCE: STS Interface)
+                VPCE_Logs(VPCE: CloudWatch)
+            end
+
+            %% --- Private Subnets ---
+            subgraph Private_Subnet ["Private Subnet (10.0.x.x)"]
+                
+                %% Bastion Component
+                Bastion["🖥️ Bastion Host<br/>(Amazon Linux 2023)"]
+                
+                %% Lambda Component
+                Responder["λ Responder Function<br/>(Python 3.12)"]
+
+                %% K8s Worker Nodes
+                subgraph K8s_Nodes ["EKS Worker Nodes"]
+                    Pod_Kuma(🟢 Uptime Kuma)
+                    Pod_Honey(🎯 Honey Pod / Nginx)
+                    NetworkPolicy{{"⛔ NetworkPolicy<br/>(Quarantine)"}}
+                end
+            end
+        end
+    end
+
+    %% --- Data Flows ---
+
+    %% 1. The "Dumb Pipe" Tunnel (Observability)
+    User --"1. AWS SSM Session (Tunnel)"--> Bastion
+    Bastion --"2. kubectl port-forward"--> VPCE_EKS
+    VPCE_EKS --"3. Proxy Traffic"--> EKS_CP
+    EKS_CP --"4. Stream"--> Pod_Kuma
+    
+    %% 2. The Supply Chain (Smuggling)
+    Ext_Docker -.-> User
+    User --"docker push"--> ECR
+    ECR --"Image Pull"--> VPCE_ECR
+    VPCE_ECR --> K8s_Nodes
+
+    %% 3. The "Data Diode" (Tool Installation)
+    User --"Upload Binary"--> S3_Bucket
+    S3_Bucket --"Download kubectl"--> VPCE_S3
+    VPCE_S3 --> Bastion
+
+    %% 4. The Attack & Response Loop
+    User --"Trigger Event"--> EB
+    EB --> SFN
+    SFN --> Responder
+    
+    %% 5. Lambda Logic (The "Nuclear" Auth)
+    Responder --"1. Get SigV4 Token"--> VPCE_STS
+    VPCE_STS --> STS
+    Responder --"2. Apply Policy (HTTPS)"--> VPCE_EKS
+    VPCE_EKS --> EKS_CP
+    EKS_CP -.-> NetworkPolicy
+    
+    %% 6. Evidence Capture
+    Responder --"Write JSON"--> VPCE_S3
+    VPCE_S3 --> S3_Bucket
+
+    %% Styling Assignment
+    class VPCE_S3,VPCE_ECR,VPCE_EKS,VPCE_STS,VPCE_Logs net;
+    class EKS_CP,ECR,S3_Bucket,EB,SFN,STS aws;
+    class Bastion,Responder,Pod_Kuma,Pod_Honey compute;
+    class NetworkPolicy security;
+    class User,Ext_Docker external;
+'''
 
 ### ⚙️ Technologies
 | Layer | Tools |
