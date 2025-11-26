@@ -20,7 +20,7 @@ It extends that baseline into a **realistic incident-response and containment de
 - **Phase 2 Containment** - PRIOR TO PHASE 3 IMPLEMENTATION: A single Lambda function would bootstrap its own Kubernetes RBAC and perform namespace-level containment (label pods, scale deployments) while remaining inside the private network. 
 
 ---
-'''mermaid
+```mermaid
 graph TD
     %% --- Styling ---
     classDef net fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#01579b;
@@ -121,7 +121,8 @@ graph TD
     class Bastion,Responder,Pod_Kuma,Pod_Honey compute;
     class NetworkPolicy security;
     class User,Ext_Docker external;
-'''
+```
+Note: The above chart can be kind of confusing but to clarify, Step Functions live in the AWS Public Zone (the Regional Service layer). It never actually crosses the private your subnet to trigger the Lambda. Instead, it talks to the Lambda Service, which spawns an execution environment attached to the VPC.
 
 ### ⚙️ Technologies
 | Layer | Tools |
