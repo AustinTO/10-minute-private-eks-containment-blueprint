@@ -40,7 +40,7 @@ graph TD
         
         %% --- AWS Managed Control Plane (Outside VPC) ---
         subgraph AWS_Managed ["AWS Managed Services"]
-            EKS_CP[("🛡️ EKS Control Plane")]
+            EKS_CP[("🛡️ EKS Control Plane API")]
             ECR[("📦 Private ECR")]
             S3_Bucket[("🗄️ Evidence S3 Bucket")]
             EB[⚡ EventBridge]
@@ -52,7 +52,7 @@ graph TD
         subgraph VPC ["🔒 Strictly Private VPC (No IGW/NAT)"]
             style VPC fill:#f5f5f5,stroke:#666,stroke-width:2px,stroke-dasharray: 5 5
 
-            %% --- VPC Endpoints (The Only Way Out) ---
+            %% --- VPC Endpoints (Egress) ---
             subgraph VPC_Endpoints ["Gateway & Interface Endpoints"]
                 VPCE_S3(VPCE: S3 Gateway)
                 VPCE_ECR(VPCE: ECR API/DKR)
@@ -64,17 +64,20 @@ graph TD
             %% --- Private Subnets ---
             subgraph Private_Subnet ["Private Subnet (10.0.x.x)"]
                 
+                %% Injected Interfaces
+                Cluster_ENI{{"🔌 EKS Cluster ENI<br/>(Cross-Account Interface)"}}
+
                 %% Bastion Component
-                Bastion["🖥️ Bastion Host<br/>(Amazon Linux 2023)"]
+                Bastion["🖥️ Bastion Host"]
                 
                 %% Lambda Component
-                Responder["λ Responder Function<br/>(Python 3.12)"]
+                Responder["λ Responder Function"]
 
                 %% K8s Worker Nodes
                 subgraph K8s_Nodes ["EKS Worker Nodes"]
                     Pod_Kuma(🟢 Uptime Kuma)
-                    Pod_Honey(🎯 Honey Pod / Nginx)
-                    NetworkPolicy{{"⛔ NetworkPolicy<br/>(Quarantine)"}}
+                    Pod_Honey(🎯 Honey Pod)
+                    NetworkPolicy{{"⛔ NetworkPolicy"}}
                 end
             end
         end
@@ -83,10 +86,11 @@ graph TD
     %% --- Data Flows ---
 
     %% 1. The "Dumb Pipe" Tunnel (Observability)
-    User --"1. AWS SSM Session (Tunnel)"--> Bastion
+    User --"1. SSM Tunnel"--> Bastion
     Bastion --"2. kubectl port-forward"--> VPCE_EKS
-    VPCE_EKS --"3. Proxy Traffic"--> EKS_CP
-    EKS_CP --"4. Stream"--> Pod_Kuma
+    VPCE_EKS --"3. Request"--> EKS_CP
+    EKS_CP =="4. Stream via ENI"==> Cluster_ENI
+    Cluster_ENI == "5. Intranet Traffic" ==> Pod_Kuma
     
     %% 2. The Supply Chain (Smuggling)
     Ext_Docker -.-> User
@@ -96,27 +100,26 @@ graph TD
 
     %% 3. The "Data Diode" (Tool Installation)
     User --"Upload Binary"--> S3_Bucket
-    S3_Bucket --"Download kubectl"--> VPCE_S3
+    S3_Bucket --"Download"--> VPCE_S3
     VPCE_S3 --> Bastion
 
     %% 4. The Attack & Response Loop
-    User --"Trigger Event"--> EB
+    User --"Trigger"--> EB
     EB --> SFN
     SFN --> Responder
     
-    %% 5. Lambda Logic (The "Nuclear" Auth)
-    Responder --"1. Get SigV4 Token"--> VPCE_STS
+    %% 5. Lambda Logic
+    Responder --"1. Get Token"--> VPCE_STS
     VPCE_STS --> STS
-    Responder --"2. Apply Policy (HTTPS)"--> VPCE_EKS
+    Responder --"2. Apply Policy"--> VPCE_EKS
     VPCE_EKS --> EKS_CP
-    EKS_CP -.-> NetworkPolicy
     
     %% 6. Evidence Capture
     Responder --"Write JSON"--> VPCE_S3
     VPCE_S3 --> S3_Bucket
 
     %% Styling Assignment
-    class VPCE_S3,VPCE_ECR,VPCE_EKS,VPCE_STS,VPCE_Logs net;
+    class VPCE_S3,VPCE_ECR,VPCE_EKS,VPCE_STS,VPCE_Logs,Cluster_ENI net;
     class EKS_CP,ECR,S3_Bucket,EB,SFN,STS aws;
     class Bastion,Responder,Pod_Kuma,Pod_Honey compute;
     class NetworkPolicy security;
