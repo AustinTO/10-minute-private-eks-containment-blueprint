@@ -242,19 +242,101 @@ resource "aws_eks_access_policy_association" "lambda_admin" {
 ---
 
 ### 🧪 Testing Plan (Phase 3)
-1. **Provision** - `TF_LOG=ERROR terraform apply` and wait for completion; ensure interface endpoints (S3/ECR/STS/Logs) exist.  
-2. **Trigger** - Send the containment event:
-   ```bash
-   aws events put-events --entries '[
-     {
-       "Source": "demo.containment",
-       "DetailType": "NamespaceContainmentRequested",
-       "Detail": "{\"namespace\":\"default\",\"reason\":\"phase3-test\",\"mode\":\"containment\"}",
-       "EventBusName": "default"
-     }
-   ]'
-   ```
-3. **Verify Evidence** - Check S3 for `runs/<ts>/containment.json` (or `audit.json`) and CloudWatch Logs for “Authentication successful” plus “Policy Created.”  
-4. **Validate Containment** - From the bastion run `kubectl describe networkpolicy quarantine-deny-all -n default`; the policy should exist while pods remain alive.  
-5. **Dashboard (dark tunnel)** - Start `kubectl port-forward` on the bastion to `:3001`, then bridge via `aws ssm start-session` to reach `http://localhost:3001` locally with no public ingress required.  
-6. **Teardown (optional)** - `terraform destroy` when finished.
+### 🧪 Testing Plan (Phase 3)
+
+**1. Provision Infrastructure**
+Initialize the "Dark Site" environment.
+```bash
+terraform init
+TF_LOG=ERROR terraform apply
+# Output: Note the 'bastion_instance_id' and 'evidence_bucket_name'
+```
+
+**2. The Supply Chain (Image Smuggling)**
+Worker nodes cannot reach Docker Hub. Pull images locally and push to private ECR.
+```bash
+# Login to Private ECR
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
+
+# Push Uptime Kuma
+docker pull louislam/uptime-kuma:1
+docker tag louislam/uptime-kuma:1 <ECR_URL>/uptime-kuma:latest
+docker push <ECR_URL>/uptime-kuma:latest
+
+# Push Honey Pod (Nginx)
+docker pull nginx:latest
+docker tag nginx:latest <ECR_URL>/web-dvwa:latest
+docker push <ECR_URL>/web-dvwa:latest
+```
+
+**3. Bootstrap the Bastion (The "S3 Data Diode")**
+The bastion has no internet to install tools. Use the S3 VPC Endpoint as a secure transfer mechanism.
+
+**A. Upload Tools (Local Machine)**
+```bash
+# Download kubectl binary
+curl -LO "[https://dl.k8s.io/release/$(curl](https://dl.k8s.io/release/$(curl) -L -s [https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl](https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl)"
+
+# Upload binary and manifests to Evidence Bucket
+aws s3 cp kubectl s3://<EVIDENCE_BUCKET>/
+aws s3 cp phase3-workloads.yaml s3://<EVIDENCE_BUCKET>/
+```
+
+**B. Install Internally (Bastion Shell)**
+```bash
+# Connect via SSM
+aws ssm start-session --target <BASTION_ID>
+
+# Pull tools from S3 via VPC Endpoint
+aws s3 cp s3://<EVIDENCE_BUCKET>/kubectl .
+aws s3 cp s3://<EVIDENCE_BUCKET>/phase3-workloads.yaml .
+
+# Install kubectl
+chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+aws eks update-kubeconfig --name <CLUSTER_NAME> --region us-east-1
+```
+
+**4. Deploy Workloads**
+Terraform cannot reach the private API. Deploy manually from the Bastion.
+```bash
+# (Inside Bastion)
+kubectl apply -f phase3-workloads.yaml
+kubectl get pods -n demo-apps # Wait for 'Running' status
+```
+
+**5. Establish Observability (Daisy-Chain Tunnel)**
+Create a secure path to view the internal dashboard without Ingress.
+
+**Hop 1: Bastion (Background)**
+```bash
+# (Inside Bastion)
+kubectl port-forward -n demo-apps deployment/uptime-kuma 3001:3001 --address 0.0.0.0 &
+```
+
+**Hop 2: Local Machine**
+```bash
+# (Local Terminal)
+aws ssm start-session \
+    --target <BASTION_ID> \
+    --document-name AWS-StartPortForwardingSession \
+    --parameters '{"portNumber":["3001"],"localPortNumber":["3001"]}'
+```
+* **Verify:** Open `http://localhost:3001` in your browser. Configure a monitor for `http://web-dvwa` (Heartbeat: 20s). It should be **GREEN**.
+
+**6. 🔥 The "Live Fire" Demo**
+Trigger the simulated compromise event from your local CLI.
+```bash
+aws events put-events --entries '[
+  {
+    "Source": "demo.containment",
+    "DetailType": "NamespaceContainmentRequested",
+    "Detail": "{\"namespace\":\"demo-apps\",\"mode\":\"containment\"}",
+    "EventBusName": "default"
+  }
+]'
+```
+
+**7. Verification**
+* **Visual:** Watch the Uptime Kuma dashboard. Within 30-40 seconds, the monitor will turn **RED** (Down) as the `quarantine-deny-all` NetworkPolicy is applied.
+* **Forensic:** Check S3 for the `containment.json` evidence file.
+* **Teardown:** `terraform destroy`.
