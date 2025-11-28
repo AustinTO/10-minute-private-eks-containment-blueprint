@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-dvwa
+  namespace: demo-apps
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-dvwa
+  template:
+    metadata:
+      labels:
+        app: web-dvwa
+    spec:
+      containers:
+      - name: web-dvwa
+        image: 637423268505.dkr.ecr.us-east-1.amazonaws.com/web-dvwa:latest
+        ports:
+        - containerPort: 80
+        env:
+        - name: MYSQL_HOST
+          value: "127.0.0.1"
+        - name: MYSQL_USER
+          value: "root"
+        - name: MYSQL_PASSWORD
+          value: "password"
+        - name: MYSQL_DB
+          value: "dvwa"
+
+      - name: mysql
+        image: 637423268505.dkr.ecr.us-east-1.amazonaws.com/mysql:5.7
+        ports:
+        - containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "password"
+        - name: MYSQL_DATABASE
+          value: "dvwa"

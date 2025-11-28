@@ -168,7 +168,7 @@ TF_LOG=ERROR terraform apply
 - End-to-end detection-to-containment completes in under 40 seconds; evidence is written to S3 as `audit.json` / `containment.json` but only viewable via either bastion port forwarding chain, or via s3 or containment s3 dashboard(lambda reading s3).
 
 
-### 🧭 Phase 3 Technical Deep Dive
+### 🧭 Phase 3.1 Technical Deep Dive
 **Architectural goal:** forensic-grade, event-driven containment inside a strictly private Kubernetes cluster with no public endpoints, no internet egress, no NAT.
 
 **Core constraints**
@@ -195,29 +195,24 @@ TF_LOG=ERROR terraform apply
 
 5) **Private observability path**  
    - Problem: Validate containment state beyond just the s3 log and dashboard (Green to Red) without exposing the dashboard.  
-   - Solution: Daisy-chain tunnels: bastion runs `kubectl port-forward` to loopback; laptop bridges via `aws ssm start-session`, yielding `http://localhost:3001` locally with no new ingress.
+   - Solution: Daisy-chain tunnels: bastion runs `kubectl port-forward` to loopback; laptop bridges via `aws ssm start-session`, yielding `http://localhost:3001` locally with no new ingress. For direct browser access to Damned Vulnerable Web App the same is done 
 
-### 🐞 Troubleshooting Deep Dive: zombie container
-- Incident: Uptime Kuma showed the `vulnerables/web-dvwa` target as down while Kubernetes reported Running.  
-- Network checks: Service existed on port 80; endpoints present.  
-- Connectivity test: `kubectl exec` curl to the Pod IP timed out (handshake reached the container, no HTTP response), ruling out SG or NetworkPolicy drops.  
-- Root cause: DVWA image waited forever for a missing MySQL dependency, leaving the socket open but unresponsive.  
-- Fix: Swapped DVWA for a stateless Nginx (Alpine) image; dashboard flipped green, proving the network path was fine.  
-- Next: Replace with a sidecar-based honey pod (vulnerable app + local MySQL) for realistic exploits.
 
-### 🔮 Phase 4 plan: runtime detection and stateful architectures
-1) Stateful vulnerable workload (sidecar pattern)  
-   - Single Deployment with two containers: `vulnerables/web-dvwa` on port 80 and `mysql:5.7` on localhost:3306.  
-   - Frontend talks to MySQL over 127.0.0.1; removes the zombie state by supplying the dependency locally.  
-2) Automated threat detection (Falco + Sidekick)  
-   - Falco DaemonSet plus Sidekick to ship Critical alerts (e.g., terminal shell) to EventBridge.  
-   - Flow: shell in honey pod -> Falco syscall alert -> EventBridge -> Lambda containment.  
-3) Automated forensic snapshotting  
-   - IAM adds `ec2:CreateSnapshot` and `ec2:DescribeInstances`.  
-   - Lambda maps compromised Pod to node and EBS volume, then snapshots with `CaseID` and `Reason=Automated_Containment`.  
-4) VPC Flow Log analysis  
-   - Enable Flow Logs on private subnets; query in Athena to confirm traffic to the compromised IP drops after containment.  
-Execution order: deploy the multi-container pod, install Falco and verify it catches `kubectl exec`, wire Sidekick to EventBridge, then add snapshotting to Lambda.
+### 🐞 Troubleshooting Highlight: Inter-Node Network Partition (Phase 3.1)
+
+The deployment of the stateful `web-dvwa` workload led to a critical debugging phase where the monitoring dashboard (Uptime Kuma) reported a persistent **Connection Timed Out** error.
+
+**The Diagnosis: The Scheduler Lottery and a False Positive**
+* **False Positive:** The previous successful health check using a lightweight **Nginx** container was misleading. Kubernetes, due to low resource requirements, likely placed the Nginx pod and the Uptime Kuma pod on the **same Worker Node**. This meant the traffic flowed locally, **avoiding the Security Group firewall** entirely.
+* **The Root Cause:** When the heavier `web-dvwa` workload was deployed, the Kubernetes scheduler, likely prioritizing load balancing due to higher resource requests, placed it on a **different Worker Node**.
+* **Confirmation:** Running `kubectl get pods -o wide` confirmed this **Cross-Node Placement**. This forced the traffic across the VPC network, where it was silently dropped by the overly restrictive **Worker Node Security Group**.
+
+**The Fix: Co-location Test and Permanent Architectural Solution**
+
+1.  **Diagnostic Test (Triage):** A `kubectl patch` was executed to implement a **Node Selector** for the `web-dvwa` deployment, forcing the Honey Pod to restart on the **same node** as the monitor. This test succeeded immediately, confirming the application was functional and the fault was purely infrastructural.
+2.  **Permanent Architectural Fix:** To ensure high availability and proper Kubernetes networking, the underlying security posture was corrected by updating the **Node Security Group** in Terraform. The fix involved adding a **Self-Referencing Ingress Rule** (`ingress_self_all` with `self = true`), which enables full pod-to-pod mesh networking between all worker nodes.
+
+This final configuration delegates the responsibility for fine-grained access control entirely back to the software layer (the **NetworkPolicy**), while ensuring the underlying VPC infrastructure is correctly configured for distributed workloads.
 
 **Auth logic (Python)**  
 ```python
@@ -263,8 +258,8 @@ docker pull louislam/uptime-kuma:1
 docker tag louislam/uptime-kuma:1 <ECR_URL>/uptime-kuma:latest
 docker push <ECR_URL>/uptime-kuma:latest
 
-# Push Honey Pod (Nginx)
-docker pull nginx:latest
+# Push Honey Pod (Damnn Vulnerable Web Application)
+docker pull web-dvwa:latest
 docker tag nginx:latest <ECR_URL>/web-dvwa:latest
 docker push <ECR_URL>/web-dvwa:latest
 ```
@@ -300,7 +295,7 @@ aws eks update-kubeconfig --name <CLUSTER_NAME> --region us-east-1
 Terraform cannot reach the private API. Deploy manually from the Bastion.
 ```bash
 # (Inside Bastion)
-kubectl apply -f phase3-workloads.yaml
+kubectl apply -f phase3-1-workloads.yaml
 kubectl get pods -n demo-apps # Wait for 'Running' status
 ```
 
@@ -311,6 +306,8 @@ Create a secure path to view the internal dashboard without Ingress.
 ```bash
 # (Inside Bastion)
 kubectl port-forward -n demo-apps deployment/uptime-kuma 3001:3001 --address 0.0.0.0 &
+# for direct access to dvwa
+kubectl port-forward -n demo-apps deployment/web-dvwa 8080:80 --address 0.0.0.0 &
 ```
 
 **Hop 2: Local Machine**
@@ -320,11 +317,18 @@ aws ssm start-session \
     --target <BASTION_ID> \
     --document-name AWS-StartPortForwardingSession \
     --parameters '{"portNumber":["3001"],"localPortNumber":["3001"]}'
+
+#Separate terminal if you want DVWA access
+aws ssm start-session \
+    --target <BASTION_ID> \
+    --document-name AWS-StartPortForwardingSession \
+    --parameters '{"portNumber":["8080"],"localPortNumber":["8080"]}'
 ```
 * **Verify:** Open `http://localhost:3001` in your browser. Configure a monitor for `http://web-dvwa` (Heartbeat: 20s). It should be **GREEN**.
+Open `http://localhost:8080`
 
 **6. 🔥 The "Live Fire" Demo**
-Trigger the simulated compromise event from your local CLI.
+Trigger the simulated containment triggering event from your local CLI.
 ```bash
 aws events put-events --entries '[
   {
@@ -340,3 +344,27 @@ aws events put-events --entries '[
 * **Visual:** Watch the Uptime Kuma dashboard. Within 30-40 seconds, the monitor will turn **RED** (Down) as the `quarantine-deny-all` NetworkPolicy is applied.
 * **Forensic:** Check S3 for the `containment.json` evidence file.
 * **Teardown:** `terraform destroy`.
+
+### 🔮 Phase 4: Autonomous Runtime Defense & Forensic Capture
+
+This phase integrates a kernel sensor (Falco) to achieve **true, automatic threat detection**, fulfilling the goal of building a fully reactive security pipeline.
+
+#### 1. Instrumentation: Deploying the Sensor (Falco)
+
+* **Objective:** Achieve automatic event generation upon a security violation, eliminating the need for the manual CLI trigger.
+* **Workload Fix:** Implement the **Kubernetes Sidecar Pattern** (Vulnerable App + local MySQL 5.7) within a single Pod. This resolves the previous database dependency and enables realistic testing (SQLi, RCE).
+* **Detection (The Sensor):** Deploy **Falco** (DaemonSet) for kernel syscall monitoring.
+* **Event Routing:** Configure **Falcosidekick** to capture high-severity Falco alerts (e.g., terminal shell in container) and push the structured event directly to **AWS EventBridge**.
+
+#### 2. Remediation Logic: Forensic Snapshotting
+
+* **Objective:** Ensure persistent disk evidence is secured immediately upon network isolation.
+* **Architecture:** The containment Lambda will execute this sequence *before* applying the NetworkPolicy.
+* **IAM Preparation:** Grant the Lambda execution role the necessary **EC2 Snapshot** permissions (`ec2:CreateSnapshot`, `ec2:DescribeVolumes`, etc.).
+* **Mechanism:** The Lambda uses the **EC2 API** to map the Compromised Pod $\to$ Worker Node $\to$ **EBS Volume ID**. It then triggers an immediate, non-blocking snapshot of that EBS volume, tagging it with `CaseID` for forensic analysis.
+
+#### 3. Verification: Cross-Layer Forensics
+
+* **Objective:** Validate that the containment worked via independent network verification.
+* **Mechanism:** Enable **VPC Flow Logs** on the private subnets.
+* **Validation:** Use **Amazon Athena** or CloudWatch Logs Insights to query the flow logs. The query will confirm that traffic destined for the compromised Pod IP dropped to zero instantly following the containment timestamp.
